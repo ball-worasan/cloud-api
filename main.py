@@ -1,3 +1,4 @@
+import re
 import cv2  # type: ignore
 import json
 import base64
@@ -13,11 +14,19 @@ from sklearn.model_selection import GridSearchCV  # type: ignore
 from fastapi import FastAPI, File, UploadFile, HTTPException  # type: ignore
 from fastapi.responses import Response, HTMLResponse  # type: ignore
 from fastapi.middleware.cors import CORSMiddleware  # type: ignore
+from datetime import datetime, timedelta
 from typing import Dict, List, Tuple
 from pathlib import Path
 from load_weights import load_cloud_model  # type: ignore
-import aiohttp  # type: ignore
-import asyncio
+
+# import aiohttp  # type: ignore
+# import asyncio
+
+# เพิ่มเติม: ใช้ PyTesseract ในการทำ OCR
+import pytesseract  # type: ignore
+
+# pytesseract.image_to_string
+pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
 
 # ------------------------------------------------------------------------------
 # การตั้งค่าเริ่มต้น
@@ -73,10 +82,11 @@ except Exception as e:
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["OPTIONS", "POST", "GET"],
+    allow_origins=["*"],
+    allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Next-Time"],
 )
 
 
@@ -250,6 +260,7 @@ def convert_grayscale_to_rgb(
     h, w = image.shape
     dbz_vals = (image.astype(np.float32) / 255.0) * (dbz_max - dbz_min) + dbz_min
     rgb_image = dbz_to_rgb_batch(dbz_vals.flatten()).reshape(h, w, 3)
+    # สามารถแก้เงื่อนไขการ mask สีดำตามต้องการได้
     black_mask = (dbz_vals >= 8.0) & (dbz_vals <= 22.0)
     rgb_image[black_mask] = [0, 0, 0]
     return rgb_image
@@ -355,60 +366,114 @@ async def convert_image(file: UploadFile = File(...)):
 
 
 @app.post("/prepare-images")
-async def prepare_images(
-    images: List[UploadFile] = File(...),
-):
+async def prepare_images(images: List[UploadFile] = File(...)):
     try:
         if not images:
             raise HTTPException(status_code=400, detail="No images provided")
 
-        grayscale_images = []  # เก็บ grayscale frames สำหรับ Cloud Prediction
-        background_rgb = BACKGROUND_IMAGE
-
-        # Step 1-5: ประมวลผลภาพ (รักษา uint8)
-        for idx, upload_file in enumerate(images):
-            logger.info(f"Processing image {idx+1}: {upload_file.filename}")
+        # 1) อ่านข้อมูลไฟล์ทั้งหมดครั้งเดียว เก็บใน list
+        file_contents_list = []
+        for upload_file in images:
             contents = await upload_file.read()
             if not contents:
                 raise HTTPException(
                     status_code=400, detail=f"Empty file: {upload_file.filename}"
                 )
+            file_contents_list.append(contents)
 
-            # Step 1: Decode
+        # ============ เพิ่มตัวเก็บผล OCR =============
+        # เก็บเป็น list ของ string เช่น "10:54 / 21-Mar-2024"
+        ocr_results = []
+
+        # 2) OCR: ตรวจจับข้อความในพื้นที่ (x: 801-967, y: 0-100)
+        for idx, contents in enumerate(file_contents_list):
             decoded_img = cv2.imdecode(
                 np.frombuffer(contents, np.uint8), cv2.IMREAD_COLOR
             )
             if decoded_img is None:
                 raise HTTPException(
-                    status_code=400, detail=f"Invalid image: {upload_file.filename}"
+                    status_code=400, detail=f"Invalid image: {images[idx].filename}"
                 )
-            if DEBUG:
-                logger.debug(
-                    f"Step 1 (Decode) - dtype: {decoded_img.dtype}, shape: {decoded_img.shape}, color: BGR"
+
+            # ตัวอย่าง: เช็กขนาดภาพก่อน OCR
+            if decoded_img.shape[1] >= 967 and decoded_img.shape[0] >= 100:
+                # เลือก Crop บริเวณ [y0:y1, x0:x1]
+                ocr_region = decoded_img[30:60, 801:967]
+                text_found = pytesseract.image_to_string(
+                    Image.fromarray(ocr_region)
+                ).strip()
+                logger.info(f"OCR (Image {idx+1}): {text_found}")
+                ocr_results.append(text_found)
+            else:
+                logger.info(
+                    f"OCR Skipped (Image {idx+1}): Image size too small for 801-969x0-100 region."
+                )
+                ocr_results.append("")  # เก็บเป็นค่าว่างถ้าไม่เจอ
+
+        # ==================== ส่วน Parsing OCR =========================
+        # สมมติรูปแบบเป็น "HH:MM / DD-MMM-YYYY" เช่น "10:54 / 21-Mar-2024"
+        # เราจะ parse เป็น datetime
+        def parse_ocr_datetime(ocr_text: str) -> datetime:
+            """
+            พยายามแยกเวลา (HH:MM) และวันที่ (DD-Mon-YYYY) จาก string
+            Return เป็น datetime object (ถ้า parse สำเร็จ)
+            """
+            # ตัวอย่าง regex: (\d{1,2}:\d{2}) => เวลา , (\d{1,2}-[A-Za-z]{3}-\d{4}) => วันที่
+            pattern = r"(\d{1,2}:\d{2})\s*/\s*(\d{1,2}-[A-Za-z]{3}-\d{4})"
+            match = re.search(pattern, ocr_text)
+            if not match:
+                return None  # หรือ raise error
+
+            time_str = match.group(1)  # เช่น "10:54"
+            date_str = match.group(2)  # เช่น "21-Mar-2024"
+
+            # แปลง date_str เป็น datetime => "%d-%b-%Y" (day-month_abbrev-year)
+            # "%b" จะ parse "Mar" "Jan" "Feb" etc.
+            try:
+                date_part = datetime.strptime(
+                    date_str, "%d-%b-%Y"
+                )  # ได้ 2024-03-21 00:00:00
+                # แปลง time_str เป็น เวลา
+                hh, mm = time_str.split(":")
+                date_part = date_part.replace(hour=int(hh), minute=int(mm))
+                return date_part
+            except ValueError:
+                return None
+
+        # หากมี 8 รูป เราจะ parse วันที่ + เวลาทั้ง 8
+        times_ocr = []
+        if len(images) == 8:
+            for text in ocr_results:
+                dt = parse_ocr_datetime(text)
+                if dt is None:
+                    # ถ้า parse ไม่ได้ จะเก็บ None
+                    times_ocr.append(None)
+                else:
+                    times_ocr.append(dt)
+            # ตัวอย่าง: times_ocr = [datetime(2024,3,21,10,54), datetime(2024,3,21,11,0), ...]
+
+        # 3) ประมวลผลภาพตามขั้นตอน (Crop, Replace, Predict dBZ)
+        grayscale_images = []
+        for idx, contents in enumerate(file_contents_list):
+            logger.info(f"Processing image {idx+1}: {images[idx].filename}")
+            decoded_img = cv2.imdecode(
+                np.frombuffer(contents, np.uint8), cv2.IMREAD_COLOR
+            )
+            if decoded_img is None:
+                raise HTTPException(
+                    status_code=400, detail=f"Invalid image: {images[idx].filename}"
                 )
 
             # Step 2: Crop 1
             crop_area = (0, 0, 800, 800)
             cropped_img = crop_image(decoded_img, crop_area)
-            if DEBUG:
-                logger.debug(
-                    f"Step 2 (Crop 1) - dtype: {cropped_img.dtype}, shape: {cropped_img.shape}, color: BGR"
-                )
 
             # Step 3: Replace Pixels
-            processed_img = replace_pixels(cropped_img, background_rgb)
-            if DEBUG:
-                logger.debug(
-                    f"Step 3 (Replace Pixels) - dtype: {processed_img.dtype}, shape: {processed_img.shape}, color: BGR"
-                )
+            processed_img = replace_pixels(cropped_img, BACKGROUND_IMAGE)
 
             # Step 4: Crop 2
             crop_area_2 = (400, 67, 733, 400)
             cropped_img_2 = crop_image(processed_img, crop_area_2)
-            if DEBUG:
-                logger.debug(
-                    f"Step 4 (Crop 2) - dtype: {cropped_img_2.dtype}, shape: {cropped_img_2.shape}, color: BGR"
-                )
 
             # Step 5: Predict dBZ (ได้ grayscale uint8)
             grayscale_batch = predict_dbz_from_image_batch(
@@ -419,92 +484,109 @@ async def prepare_images(
                 DEFAULT_DBZ_MIN,
                 DEFAULT_DBZ_MAX,
             )
-            grayscale_image = grayscale_batch[0, ..., 0]  # Shape: (333, 333), uint8
-            if DEBUG:
-                logger.debug(
-                    f"Step 5 (Predict dBZ) - dtype: {grayscale_image.dtype}, shape: {grayscale_image.shape}, color: Grayscale"
-                )
-
+            grayscale_image = grayscale_batch[0, ..., 0]  # (333, 333)
             grayscale_images.append(grayscale_image)
 
-        # Step 6: Cloud Prediction (เมื่อมี 8 ภาพ)
+        # ==================== เช็ควันที่และเวลา (เมื่อมี 8 ภาพ) ====================
+        next_time_str = None  # เอาไว้เก็บเวลาถัดไปในรูป string
         if len(images) == 8:
             try:
-                # เตรียม input สำหรับโมเดล
+                # กรอง None ออก
+                valid_datetimes = [dt for dt in times_ocr if dt is not None]
+
+                # ตรวจว่าทั้ง 8 รูป parse ได้ครบหรือไม่
+                if len(valid_datetimes) != 8:
+                    logger.warning(
+                        "Some OCR time cannot be parsed or missing. Skip checking times."
+                    )
+                else:
+                    # 1) เช็คว่า วัน/เดือน/ปี ตรงกันหมดไหม
+                    #    เอาวันที่ภาพแรกเป็นเกณฑ์
+                    base_date = valid_datetimes[
+                        0
+                    ].date()  # ex: datetime.date(2024,3,21)
+                    all_same_date = all(
+                        dt.date() == base_date for dt in valid_datetimes
+                    )
+                    if not all_same_date:
+                        logger.warning("Date is not consistent across all 8 images.")
+                    else:
+                        # 2) เช็ค interval ระหว่างภาพ
+                        intervals = []
+                        for i in range(7):
+                            diff = valid_datetimes[i + 1] - valid_datetimes[i]
+                            intervals.append(diff)
+
+                        # สมมติว่าเราคาดว่า interval เท่ากันหมด
+                        # ก็เช็คว่า intervals[i] == intervals[0] สำหรับ i in range(1..len)
+                        # (เผื่อมีเคสต่างกันเล็กน้อย, อาจต้องยืดหยุ่น)
+                        if all(iv == intervals[0] for iv in intervals):
+                            # ได้ interval หลัก
+                            main_interval = intervals[0]  # type: timedelta
+                            # แปลงเป็นนาที
+                            interval_minutes = int(main_interval.total_seconds() // 60)
+                            logger.info(
+                                f"Images have consistent interval: {interval_minutes} minutes"
+                            )
+
+                            # 3) คำนวณเวลาถัดไป
+                            last_dt = valid_datetimes[-1]
+                            next_dt = last_dt + main_interval
+                            next_time_str = next_dt.strftime("%H:%M")  # เช่น "11:42"
+                            logger.info(f"Next time = {next_time_str}")
+                        else:
+                            logger.warning(
+                                "Time intervals among images are not consistent."
+                            )
+
+            except Exception as e:
+                logger.error(f"Error checking date/time: {e}")
+
+        # 4) หากมี 8 ภาพ ให้ทำ Cloud Prediction (ทำไปแล้วข้างบน)
+        if len(images) == 8:
+            try:
                 input_data = prepare_input_for_model(
                     grayscale_images
-                )  # Shape: (1, 8, 333, 333, 1), float32 [0, 1]
-                if DEBUG:
-                    logger.debug(
-                        f"Prepared input - dtype: {input_data.dtype}, shape: {input_data.shape}"
-                    )
-
-                # ทำนายด้วย cloud_model
-                predicted_cloud = cloud_model.predict(
-                    input_data, verbose=0
-                )  # Shape: (1, 333, 333, 1), float32 [0, 1]
+                )  # (1, 8, 333, 333, 1)
+                predicted_cloud = cloud_model.predict(input_data, verbose=0)
                 if predicted_cloud.shape != (1, 333, 333, 1):
                     raise ValueError(
                         f"Expected output shape (1, 333, 333, 1), got {predicted_cloud.shape}"
                     )
-
-                # แปลง output กลับเป็น uint8 (0-255)
                 predicted_cloud_image = (predicted_cloud[0, ..., 0] * 255).astype(
                     np.uint8
-                )  # Shape: (333, 333)
-                if DEBUG:
-                    logger.debug(
-                        f"Step 6 (Cloud Prediction) - dtype: {predicted_cloud_image.dtype}, "
-                        f"shape: {predicted_cloud_image.shape}, color: Grayscale"
-                    )
-
+                )
             except Exception as e:
-                logger.error(f"Error in Step 6 (Cloud Prediction): {e}")
+                logger.error(f"Error in Cloud Prediction: {e}")
                 raise HTTPException(
                     status_code=500, detail=f"Cloud Prediction failed: {str(e)}"
                 )
 
-        # Step 7: Convert
+        # 5) Convert ส่งออก (ใช้ภาพทำนายถ้า 8 ภาพ, ไม่งั้นใช้ grayscale สุดท้าย)
         try:
-            # ใช้ predicted_cloud_image หากอัพโหลดภาพครบ 8 ภาพ
-            # ถ้าน้อยกว่า 8 ภาพ ให้ใช้ grayscale_images[-1]
             image_for_convert = (
                 predicted_cloud_image if len(images) == 8 else grayscale_images[-1]
             )
-
+            # ---------- ส่ง Response ----------
             success, img_encoded = cv2.imencode(".png", image_for_convert)
             if not success:
                 raise HTTPException(status_code=500, detail="Grayscale encoding failed")
-            file_content = BytesIO(img_encoded.tobytes())
-            converted_response = await convert_image(
-                UploadFile(filename="predicted_cloud.png", file=file_content)
-            )
-            converted_img = cv2.imdecode(
-                np.frombuffer(converted_response.body, np.uint8), cv2.IMREAD_COLOR
-            )
-            if DEBUG:
-                logger.debug(
-                    f"Step 7 (Convert) - dtype: {converted_img.dtype}, "
-                    f"shape: {converted_img.shape}, color: BGR"
-                )
 
-            # เข้ารหัสภาพที่ convert แล้วเป็น PNG
-            success, final_img_encoded = cv2.imencode(".png", converted_img)
-            if not success:
-                raise HTTPException(
-                    status_code=500, detail="Final image encoding failed"
-                )
-
-            # ส่งออกเป็น Response
-            logger.info("Image processed and converted successfully")
             return Response(
-                content=final_img_encoded.tobytes(),
+                content=img_encoded.tobytes(),
                 media_type="image/png",
-                headers={"Content-Disposition": "inline; filename=output_image.png"},
+                headers={
+                    "Content-Disposition": "inline; filename=output_image.png",
+                    "X-Next-Time": next_time_str,
+                    "Access-Control-Expose-Headers": "X-Next-Time",
+                },
             )
+
+            logger.info("Image processed and converted successfully")
+            return response
 
         except Exception as e:
-            logger.error(f"Error in Step 7 (Convert): {e}")
+            logger.error(f"Error in Step Convert: {e}")
             raise HTTPException(status_code=500, detail=f"Convert failed: {str(e)}")
 
     except HTTPException as e:
